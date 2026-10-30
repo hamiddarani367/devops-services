@@ -1,0 +1,168 @@
+version: '3.8'
+
+services:
+  # ======================================================
+  # 1. VictoriaMetrics Cluster (ذخیره‌سازی و پردازش)
+  # ======================================================
+
+  # -------- ذخیره‌سازی داده (vmstorage) --------
+  vmstorage:
+    image: docker.lib2.tiddev.com/victoriametrics/vmstorage:v1.150.0-cluster
+    container_name: vmstorage
+    restart: unless-stopped
+    ports:
+      - "8400:8400"   # برای اتصال vminsert (دریافت داده)
+      - "8401:8401"   # برای اتصال vmselect (خواندن داده)
+    volumes:
+      - vmstorage_data:/storage
+    command:
+      - "-storageDataPath=/storage"
+      - "-retentionPeriod=5d"
+      - "-vminsertAddr=:8400"
+      - "-vmselectAddr=:8401"
+    networks:
+      - victoria_network
+
+  # -------- دریافت داده (vminsert) با Replication=2 --------
+  vminsert:
+    image: docker.lib2.tiddev.com/victoriametrics/vminsert:v1.150.0-cluster
+    container_name: vminsert
+    restart: unless-stopped
+    ports:
+      - "8480:8480"
+    command:
+      # ✅ پورت صحیح برای vminsert: 8400
+      - "-storageNode=192.168.101.111:8400"
+      - "-storageNode=192.168.101.112:8400"
+      - "-storageNode=192.168.101.113:8400"
+      - "-replicationFactor=2"
+    networks:
+      - victoria_network
+
+  # -------- پاسخ به کوئری (vmselect) با Deduplication --------
+  vmselect:
+    image: docker.lib2.tiddev.com/victoriametrics/vmselect:v1.150.0-cluster
+    container_name: vmselect
+    restart: unless-stopped
+    ports:
+      - "8481:8481"
+    command:
+      # ✅ پورت صحیح برای vmselect: 8401 (نه 8400!)
+      - "-storageNode=192.168.101.111:8401"
+      - "-storageNode=192.168.101.112:8401"
+      - "-storageNode=192.168.101.113:8401"
+      - "-dedup.minScrapeInterval=15s"
+    networks:
+      - victoria_network
+
+  # ======================================================
+  # 2. جمع‌آوری داده (vmagent) با Cluster Mode
+  # ======================================================
+
+  vmagent:
+    image: docker.lib2.tiddev.com/victoriametrics/vmagent:v1.150.0
+    container_name: vmagent
+    restart: unless-stopped
+    ports:
+      - "8429:8429"
+    volumes:
+      - ./vmagent.yml:/etc/vmagent/config.yml:ro
+    command:
+      # ✅ مسیر صحیح برای ارسال داده در حالت خوشه‌ای
+      - "-remoteWrite.url=http://192.168.101.111:8480/insert/0/prometheus/api/v1/write"
+      - "-remoteWrite.url=http://192.168.101.112:8480/insert/0/prometheus/api/v1/write"
+      - "-remoteWrite.url=http://192.168.101.113:8480/insert/0/prometheus/api/v1/write"
+      - "-promscrape.config=/etc/vmagent/config.yml"
+      - "-promscrape.cluster.name=vmcluster"
+      - "-promscrape.cluster.memberNum=2"          # در هر ماشین: 0, 1, 2
+      - "-promscrape.cluster.membersCount=3"       # تعداد کل agentها
+      - "-promscrape.cluster.replicationFactor=1"
+      - "-httpListenAddr=:8429"
+    networks:
+      - victoria_network
+
+  # ======================================================
+  # 3. مدیریت هشدارها (vmalert)
+  # ======================================================
+
+  vmalert:
+    image: docker.lib2.tiddev.com/victoriametrics/vmalert:v1.150.0
+    container_name: vmalert
+    restart: unless-stopped
+    ports:
+      - "8880:8880"
+    volumes:
+      - ./vmalert_rules.yml:/etc/vmalert/rules.yml:ro
+    command:
+      # ✅ مسیر صحیح برای کوئری در حالت خوشه‌ای
+      - "-datasource.url=http://192.168.101.111:8481/select/0/prometheus"
+      - "-datasource.url=http://192.168.101.112:8481/select/0/prometheus"
+      - "-datasource.url=http://192.168.101.113:8481/select/0/prometheus"
+      - "-notifier.url=http://alertmanager:9093"
+      - "-rule=/etc/vmalert/rules.yml"
+      - "-httpListenAddr=:8880"
+      - "-evaluationInterval=15s"
+    depends_on:
+      - alertmanager
+    networks:
+      - victoria_network
+
+  # ======================================================
+  # 4. Alertmanager (مدیریت و ارسال هشدارها)
+  # ======================================================
+
+  alertmanager:
+    image: docker.lib2.tiddev.com/prometheus/alertmanager:v0.33.0
+    container_name: alertmanager
+    restart: unless-stopped
+    ports:
+      - "9093:9093"
+    volumes:
+      - ./alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+    command:
+      - "--config.file=/etc/alertmanager/alertmanager.yml"
+    networks:
+      - victoria_network
+
+# ======================================================
+# شبکه و Volumeها
+# ======================================================
+
+networks:
+  victoria_network:
+    driver: bridge
+
+volumes:
+  vmstorage_data:
+=========================================================
+####### alertmanager.yml ########
+route:
+  group_by: ['alertname']
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+  receiver: 'default-receiver'
+
+receivers:
+  - name: 'default-receiver'
+    webhook_configs:
+      - url: 'http://your-webhook-url'   # به Slack یا Telegram وصل کنید
+=========================================================
+######## vmagent.yml #########
+global:
+  scrape_interval: 15s
+  scrape_timeout: 10s
+
+scrape_configs:
+  - job_name: 'vmagent'
+    static_configs:
+      - targets: ['localhost:8429']
+
+  - job_name: 'node_exporter'
+    static_configs:
+      - targets:
+        - '192.168.101.111:9100'
+        - '192.168.101.112:9100'
+        - '192.168.101.113:9100'
+================================================================
+vmalert_rules.yml

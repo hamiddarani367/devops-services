@@ -1,0 +1,213 @@
+server:
+  remoteWrite:
+    - url: "http://192.168.101.113:8482/insert/0/prometheus/api/v1/write"
+      queue_config:
+        max_samples_per_send: 10000
+        capacity: 20000
+        max_shards: 30
+  global:
+    scrape_interval: 30s
+  statefulSet:
+    enabled: false
+  persistentVolume:
+    enabled: false
+  route:
+    main:
+      enabled: true
+      parentRefs:
+        - name: main-gateway
+          namespace: default
+      hostnames:
+        - prometheus.keyhan.tiddev.com
+      matches:
+        - path:
+            type: PathPrefix
+            value: /
+
+  alertmanagers:
+    - static_configs:
+      - targets:
+          - "192.168.100.165:9093"
+serverFiles:
+  alerting_rules.yml:
+    groups:
+      - name: keyhan-service-alerts
+        rules:
+          - alert: KeyhanServiceDown
+            expr: up{application=~".+", application!~"lcr-clt-mig-loader|gls-doc-transfer-batch"} == 0
+            for: 1m
+            labels:
+              severity: critical
+              project: keyhan
+              environment: qa
+            annotations:
+              summary: "Service {{ $labels.application }} is down"
+              description: "All targets for app {{ $labels.application }} are down."
+
+
+      - name: blackbox-services
+        rules:
+          - alert: BlackboxServiceDown
+            expr: up{application="", node=~".+", job!~"kubernetes.*"} == 0
+            for: 1m
+            labels:
+              severity: critical
+              project: lon
+              environment: prod
+            annotations:
+              summary: "Blackbox service {{ $labels.job }} on {{ $labels.node }} is down"
+              description: "Service {{ $labels.job }} on node {{ $labels.node }} has been down for more than 1 minutes."
+
+      - name: kubernetes-nodes
+        rules:
+          - alert: KubernetesNodeDown
+            expr: up{job=~"node-exporter.*"} == 0
+            for: 1m
+            labels:
+              severity: critical
+              project: keyhan
+              environment: qa
+            annotations:
+              summary: "Node-exporter is down on node {{ $labels.instance }}"
+              description: "Node-exporter for node {{ $labels.instance }} is not responding."
+
+      - name: application-latency
+        rules:
+          - alert: HighApplicationLatency
+            expr: rate(http_server_requests_seconds_sum{uri!~"/actuator.*"}[1m])
+              / rate(http_server_requests_seconds_count{uri!~"/actuator.*"}[1m]) > 6
+            for: 1m
+            labels:
+              severity: critical
+              project: keyhan
+              environment: prod
+            annotations:
+              summary: "High latency detected"
+              description: "Average response time for application {{$labels.application}} is above 6s in the last 1 minutes."
+
+      - name: node-exporter-resources
+        rules:
+          - alert: HighCpuUsage
+            expr: 100 * (1 - avg by(instance) (irate(node_cpu_seconds_total{mode="idle", job=~"node-exporter.*"}[5m]))) > 80
+            for: 5m
+            labels:
+              severity: critical
+              project: keyhan
+              environment: qa
+            annotations:
+              summary: "High CPU usage on node {{ $labels.instance }}"
+              description: "CPU usage is above 80% for more than 5 minutes."
+
+          - alert: HighMemoryUsage
+            expr: 100 * (1 - ((node_memory_MemAvailable_bytes{job=~"node-exporter.*"}) / (node_memory_MemTotal_bytes{job=~"node-exporter.*"}))) > 80
+            for: 5m
+            labels:
+              severity: critical
+              project: keyhan
+              environment: qa
+            annotations:
+              summary: "High memory usage on node {{ $labels.instance }}"
+              description: "Memory usage is above 90% for more than 5 minutes."
+
+          - alert: HighDiskUsage
+            expr: 100 * (node_filesystem_size_bytes{fstype!~"tmpfs|aufs|overlay", job=~"node-exporter.*"} - node_filesystem_free_bytes{fstype!~"tmpfs|aufs|overlay", job=~"node-exporter.*"})
+                   / node_filesystem_size_bytes{fstype!~"tmpfs|aufs|overlay", job=~"node-exporter.*"} > 80
+            for: 5m
+            labels:
+              severity: critical
+              project: keyhan
+              environment: qa
+            annotations:
+              summary: "High disk usage on node {{ $labels.instance }}"
+              description: "Disk usage is above 90% for more than 5 minutes."
+
+      - name: pod-uptime
+        rules:
+          - alert: PodRecentlyRestarted
+            expr: (time() - kube_pod_start_time) < 300
+            for: 0m
+            labels:
+              severity: warning
+              project: keyhan
+              environment: qa
+            annotations:
+              summary: "Pod {{ $labels.pod }} restarted recently"
+              description: "Pod {{ $labels.pod }} in namespace {{ $labels.namespace }} restarted less than 5 minutes ago."
+
+      - name: container-memory
+        rules:
+          - alert: HighContainerMemoryUsage
+            expr: |
+             (container_memory_working_set_bytes{container!="",pod!=""}
+             / kube_pod_container_resource_limits_memory_bytes{container!="",pod!=""} > 0.8)
+            for: 2m
+            labels:
+              severity: warning
+              project: keyhan
+              environment: qa
+            annotations:
+              summary: "High memory usage on {{ $labels.pod }} ({{ $labels.namespace }})"
+              description: "Container {{ $labels.container }} in Pod {{ $labels.pod }} (ns: {{ $labels.namespace }}) is using more than 80% of its memory limit."
+
+          - alert: ContainerMemoryAbove4GiB
+            expr: |
+              (container_memory_working_set_bytes{container!="",pod!=""} > 4 * 1024 * 1024 * 1024) unless kube_pod_container_resource_limits_memory_bytes{container!="",pod!=""} > 0
+            for: 2m
+            labels:
+              severity: warning
+              project: keyhan
+              environment: qa
+            annotations:
+              summary: "High absolute memory usage on {{ $labels.pod }} ({{ $labels.namespace }})"
+              description: "Container {{ $labels.container }} in Pod {{ $labels.pod }} (ns: {{ $labels.namespace }}) is using more than 4GiB memory (no limit set)."
+
+extraScrapeConfigs: |
+  - job_name: 'keyhan-service-discovery'
+    eureka_sd_configs:
+      - server: 'http://registry.keyhan-qa.svc.cluster.local:8761/eureka'
+    relabel_configs:
+      - source_labels: [__meta_eureka_app_instance_metadata_management_context_path]
+        target_label: __metrics_path__
+      - source_labels: [__address__]
+        target_label: job
+      - source_labels: [__meta_eureka_app_instance_vip_address]
+        target_label: application
+        action: replace
+
+  - job_name: node-exporter-haproxy
+    static_configs:
+      - targets:
+          - 192.168.101.198:9100
+        labels:
+          node_name: k8s-haproxy-keyhan
+
+  - job_name: node-exporter-master
+    static_configs:
+      - targets:
+          - 192.168.101.136:9100
+        labels:
+          node_name: k8s-m1
+
+  - job_name: node-exporter-worker
+    static_configs:
+      - targets:
+          - 192.168.101.137:9100
+        labels:
+          node_name: k8s-w1
+      - targets:
+          - 192.168.101.138:9100
+        labels:
+          node_name: k8s-w2
+      - targets:
+          - 192.168.101.139:9100
+        labels:
+          node_name: k8s-w3
+
+prometheus-node-exporter:
+  enabled: true
+
+prometheus-alertmanager:
+  enabled: false
+
+prometheus-pushgateway:
+  enabled: false

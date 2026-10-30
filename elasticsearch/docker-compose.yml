@@ -1,0 +1,381 @@
+version: "3.8"
+
+services:
+
+  # ============================================================
+  # Certificate Generator
+  # ============================================================
+
+  elastic-setup:
+    image: docker.lib2.tiddev.com/elasticsearch/elasticsearch:${STACK_VERSION:-9.2.2}
+
+    container_name: elastic-setup
+
+    user: "0"
+
+    environment:
+      ES_IP: ${ES_IP:-127.0.0.1}
+      KIBANA_IP: ${KIBANA_IP:-127.0.0.1}
+
+    volumes:
+      - certs:/usr/share/elasticsearch/config/certs
+
+    command:
+      - /bin/bash
+      - -c
+      - |
+        set -e
+
+        CERT_DIR="/usr/share/elasticsearch/config/certs"
+
+        echo "======================================"
+        echo " Generating certificates"
+        echo "======================================"
+
+        mkdir -p "$${CERT_DIR}"
+
+        # ======================================================
+        # Generate CA
+        # ======================================================
+
+        if [ ! -f "$${CERT_DIR}/ca/ca.crt" ]; then
+
+          echo "=== Generating CA ==="
+
+          bin/elasticsearch-certutil ca \
+            --silent \
+            --pem \
+            --out "$${CERT_DIR}/ca.zip"
+
+          unzip -o \
+            "$${CERT_DIR}/ca.zip" \
+            -d "$${CERT_DIR}"
+
+          rm -f "$${CERT_DIR}/ca.zip"
+
+        else
+
+          echo "CA already exists."
+
+        fi
+
+
+        # ======================================================
+        # Generate ES + Kibana certificates
+        # ======================================================
+
+        if [ ! -f "$${CERT_DIR}/es01/es01.crt" ] || \
+           [ ! -f "$${CERT_DIR}/kibana/kibana.crt" ]; then
+
+          echo "=== Generating Elasticsearch and Kibana certificates ==="
+
+          cat > "$${CERT_DIR}/instances.yml" <<EOF
+        instances:
+          - name: es01
+            dns:
+              - es01
+              - localhost
+            ip:
+              - 127.0.0.1
+              - $${ES_IP}
+
+          - name: kibana
+            dns:
+              - kibana
+              - localhost
+            ip:
+              - 127.0.0.1
+              - $${KIBANA_IP}
+        EOF
+
+          cat "$${CERT_DIR}/instances.yml"
+
+          bin/elasticsearch-certutil cert \
+            --silent \
+            --pem \
+            --out "$${CERT_DIR}/certs.zip" \
+            --in "$${CERT_DIR}/instances.yml" \
+            --ca-cert "$${CERT_DIR}/ca/ca.crt" \
+            --ca-key "$${CERT_DIR}/ca/ca.key"
+
+          unzip -o \
+            "$${CERT_DIR}/certs.zip" \
+            -d "$${CERT_DIR}"
+
+          rm -f "$${CERT_DIR}/certs.zip"
+
+        else
+
+          echo "Certificates already exist."
+
+        fi
+
+
+        # ======================================================
+        # Permissions
+        # ======================================================
+
+        chmod -R 755 "$${CERT_DIR}"
+
+        echo
+        echo "======================================"
+        echo " Certificates ready"
+        echo "======================================"
+
+        find "$${CERT_DIR}" -type f | sort
+
+    networks:
+      - elastic
+
+
+  # ============================================================
+  # Elasticsearch
+  # ============================================================
+
+  es01:
+    image: docker.lib2.tiddev.com/elasticsearch/elasticsearch:${STACK_VERSION:-9.2.2}
+
+    container_name: ${NODE_NAME:-es01}
+
+    depends_on:
+      elastic-setup:
+        condition: service_completed_successfully
+
+    environment:
+
+      # --------------------------------------------------------
+      # Node / Cluster
+      # --------------------------------------------------------
+
+      node.name: ${NODE_NAME:-es01}
+      cluster.name: ${CLUSTER_NAME:-elastic-cluster}
+
+      discovery.type: single-node
+
+      # --------------------------------------------------------
+      # JVM
+      # --------------------------------------------------------
+
+      ES_JAVA_OPTS: "-Xms1g -Xmx1g"
+
+      # --------------------------------------------------------
+      # Security
+      # --------------------------------------------------------
+
+      xpack.security.enabled: "true"
+      xpack.security.enrollment.enabled: "false"
+
+      # --------------------------------------------------------
+      # HTTP HTTPS
+      # --------------------------------------------------------
+
+      xpack.security.http.ssl.enabled: "true"
+
+      xpack.security.http.ssl.certificate: "certs/es01/es01.crt"
+
+      xpack.security.http.ssl.key: "certs/es01/es01.key"
+
+      xpack.security.http.ssl.certificate_authorities: "certs/ca/ca.crt"
+
+      # --------------------------------------------------------
+      # Transport HTTPS
+      # --------------------------------------------------------
+
+      xpack.security.transport.ssl.enabled: "true"
+
+      xpack.security.transport.ssl.verification_mode: "certificate"
+
+      xpack.security.transport.ssl.certificate: "certs/es01/es01.crt"
+
+      xpack.security.transport.ssl.key: "certs/es01/es01.key"
+
+      xpack.security.transport.ssl.certificate_authorities: "certs/ca/ca.crt"
+
+      # --------------------------------------------------------
+      # Password
+      # --------------------------------------------------------
+
+      ELASTIC_PASSWORD: ${ELASTIC_PASSWORD:-ChangeMe123!}
+
+    mem_limit: ${MEM_LIMIT:-2147483648}
+
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+
+    ports:
+      - "${ES_PORT:-9200}:9200"
+
+    volumes:
+      - esdata:/usr/share/elasticsearch/data
+      - certs:/usr/share/elasticsearch/config/certs:ro
+
+    networks:
+      - elastic
+
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >
+          curl
+          --fail
+          --silent
+          --show-error
+          --cacert /usr/share/elasticsearch/config/certs/ca/ca.crt
+          -u "elastic:$${ELASTIC_PASSWORD}"
+          https://localhost:9200/_cluster/health
+          > /dev/null
+
+      interval: 10s
+      timeout: 10s
+      retries: 30
+      start_period: 90s
+
+
+  # ============================================================
+  # Kibana System Password Setup
+  # ============================================================
+
+  kibana_setup:
+    image: docker.lib2.tiddev.com/elasticsearch/elasticsearch:${STACK_VERSION:-9.2.2}
+
+    container_name: kibana-setup
+
+    depends_on:
+      es01:
+        condition: service_healthy
+
+    environment:
+
+      ELASTIC_PASSWORD: ${ELASTIC_PASSWORD:-ChangeMe123!}
+
+      KIBANA_PASSWORD: ${KIBANA_PASSWORD:-KibanaSystem123!}
+
+    volumes:
+      - certs:/usr/share/elasticsearch/config/certs:ro
+
+    command:
+      - /bin/bash
+      - -c
+      - |
+        set -e
+
+        CA="/usr/share/elasticsearch/config/certs/ca/ca.crt"
+
+        echo
+        echo "======================================"
+        echo " Configuring kibana_system"
+        echo "======================================"
+
+        curl \
+          --fail \
+          --silent \
+          --show-error \
+          --cacert "$${CA}" \
+          -X POST \
+          -u "elastic:$${ELASTIC_PASSWORD}" \
+          -H "Content-Type: application/json" \
+          "https://es01:9200/_security/user/kibana_system/_password" \
+          -d "{\"password\":\"$${KIBANA_PASSWORD}\"}"
+
+        echo
+        echo
+        echo "======================================"
+        echo " kibana_system configured"
+        echo "======================================"
+
+    networks:
+      - elastic
+
+
+  # ============================================================
+  # Kibana
+  # ============================================================
+
+  kibana:
+    image: docker.lib2.tiddev.com/kibana/kibana:${STACK_VERSION:-9.2.2}
+
+    container_name: kibana
+
+    depends_on:
+      kibana_setup:
+        condition: service_completed_successfully
+
+    environment:
+
+      # --------------------------------------------------------
+      # Server
+      # --------------------------------------------------------
+
+      SERVER_NAME: kibana
+
+      # --------------------------------------------------------
+      # Kibana HTTPS
+      # --------------------------------------------------------
+
+      SERVER_SSL_ENABLED: "true"
+
+      SERVER_SSL_CERTIFICATE: /usr/share/kibana/config/certs/kibana/kibana.crt
+
+      SERVER_SSL_KEY: /usr/share/kibana/config/certs/kibana/kibana.key
+
+      # --------------------------------------------------------
+      # Elasticsearch
+      # --------------------------------------------------------
+
+      ELASTICSEARCH_HOSTS: '["https://es01:9200"]'
+
+      ELASTICSEARCH_USERNAME: kibana_system
+
+      ELASTICSEARCH_PASSWORD: ${KIBANA_PASSWORD:-KibanaSystem123!}
+
+      ELASTICSEARCH_SSL_CERTIFICATEAUTHORITIES: /usr/share/kibana/config/certs/ca/ca.crt
+
+      # --------------------------------------------------------
+      # Kibana encryption
+      # --------------------------------------------------------
+
+      XPACK_ENCRYPTEDSAVEDOBJECTS_ENCRYPTIONKEY: "7f3a9c1e6d2b8a4f5c7e9d1a3b6f8c2e4d7a9f1c5b8e2d6a"
+
+      XPACK_SECURITY_ENCRYPTIONKEY: "9a4c7e2b5f8d1a6c3e9f7b2d5a8c1e4f6d9b3a7e2c5f8d1b"
+
+      XPACK_REPORTING_ENCRYPTIONKEY: "5d8a2f7c1e9b4d6a3f8c2e5b7d1a9f4c6e3b8d2a5f7c1e9d"
+
+      # --------------------------------------------------------
+      # Telemetry
+      # --------------------------------------------------------
+
+      TELEMETRY_ENABLED: "false"
+
+    ports:
+      - "${KIBANA_PORT:-5601}:5601"
+
+    volumes:
+      - certs:/usr/share/kibana/config/certs:ro
+
+    networks:
+      - elastic
+
+
+# ==============================================================
+# Volumes
+# ==============================================================
+
+volumes:
+
+  esdata:
+    driver: local
+
+  certs:
+    driver: local
+
+
+# ==============================================================
+# Network
+# ==============================================================
+
+networks:
+
+  elastic:
+    driver: bridge

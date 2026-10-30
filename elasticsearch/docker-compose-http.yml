@@ -1,0 +1,108 @@
+services:
+
+  es01:
+    image: docker.lib2.tiddev.com/elasticsearch/elasticsearch:${STACK_VERSION}
+    container_name: ${NODE_NAME}
+
+    environment:
+      - node.name=${NODE_NAME}
+      - cluster.name=${CLUSTER_NAME}
+      - discovery.type=single-node
+
+      - bootstrap.memory_lock=true
+
+      - xpack.security.enabled=true
+      - xpack.security.enrollment.enabled=false
+
+      - ELASTIC_PASSWORD=${ELASTIC_PASSWORD}
+
+      - ES_JAVA_OPTS=-Xms1g -Xmx1g
+
+    mem_limit: ${MEM_LIMIT}
+
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+
+    ports:
+      - "${ES_PORT}:9200"
+
+    volumes:
+      - esdata:/usr/share/elasticsearch/data
+
+    networks:
+      - elastic
+
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "curl -fsS -u elastic:${ELASTIC_PASSWORD} http://localhost:9200/_cluster/health >/dev/null"
+        ]
+      interval: 10s
+      timeout: 10s
+      retries: 30
+      start_period: 30s
+
+
+  setup:
+    image: docker.lib2.tiddev.com/elasticsearch/elasticsearch:${STACK_VERSION}
+    container_name: elastic-setup
+
+    depends_on:
+      es01:
+        condition: service_healthy
+
+    environment:
+      ELASTIC_PASSWORD: ${ELASTIC_PASSWORD}
+      KIBANA_PASSWORD: ${KIBANA_PASSWORD}
+
+    command:
+      - /bin/bash
+      - -c
+      - |
+        set -e
+
+        echo "Setting kibana_system password..."
+
+        curl -fsS \
+          -X POST \
+          -u "elastic:$${ELASTIC_PASSWORD}" \
+          -H "Content-Type: application/json" \
+          "http://es01:9200/_security/user/kibana_system/_password" \
+          -d "{\"password\":\"$${KIBANA_PASSWORD}\"}"
+
+        echo
+        echo "kibana_system password configured successfully."
+
+    networks:
+      - elastic
+
+
+  kibana:
+    image: docker.lib2.tiddev.com/kibana/kibana:${STACK_VERSION}
+    container_name: kibana
+
+    depends_on:
+      setup:
+        condition: service_completed_successfully
+
+    environment:
+      SERVER_NAME: kibana
+      ELASTICSEARCH_HOSTS: '["http://es01:9200"]'
+      ELASTICSEARCH_USERNAME: kibana_system
+      ELASTICSEARCH_PASSWORD: ${KIBANA_PASSWORD}
+
+    ports:
+      - "${KIBANA_PORT}:5601"
+
+    networks:
+      - elastic
+
+
+volumes:
+  esdata:
+
+networks:
+  elastic:

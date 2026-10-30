@@ -1,0 +1,78 @@
+version: '3.8'
+
+services:
+  haproxy:
+    image: docker.lib2.tiddev.com/haproxy:2.9.7
+    container_name: haproxy
+    restart: unless-stopped
+    ports:
+      - "8482:8481"
+      - "8404:8404"
+    volumes:
+      - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    networks:
+      - victoriametrics_victoria_network
+
+networks:
+  victoriametrics_victoria_network:
+    external: true
+=============================================================
+####### haproxy.cfg ##########
+global
+    log stdout format raw local0 info
+    maxconn 4096
+    user haproxy
+    group haproxy
+
+defaults
+    log global
+    mode http
+    option httplog
+    option dontlognull
+    timeout connect 5000ms
+    timeout client 50000ms
+    timeout server 50000ms
+
+# صفحه آمار
+frontend stats
+    bind *:8404
+    mode http
+    stats enable
+    stats uri /stats
+    stats refresh 10s
+    stats auth admin:admin
+
+# ورودی اصلی (هر دو سرویس)
+frontend http-in
+    bind *:8481   # ← این پورت برای کل ترافیک است
+    mode http
+
+    # اگر مسیر با /insert/ شروع شد، به backend مخصوص vminsert برو
+    use_backend vminsert_backend if { path_beg /insert/ }
+
+    # اگر مسیر با /select/ شروع شد، به backend مخصوص vmselect برو
+    use_backend vmselect_backend if { path_beg /select/ }
+
+    # اگر مسیر دیگری بود، می‌توانی یک fallback هم تعریف کنی (اختیاری)
+    default_backend vmselect_backend
+
+# ========== Backend برای vminsert (نوشتن) ==========
+backend vminsert_backend
+    mode http
+    balance leastconn
+    option httpchk GET /health   # vminsert معمولاً به /health پاسخ می‌دهد
+    http-check expect status 200
+    server vminsert1 192.168.101.111:8480 check
+    server vminsert2 192.168.101.112:8480 check
+    server vminsert3 192.168.101.113:8480 check
+
+# ========== Backend برای vmselect (خواندن) ==========
+backend vmselect_backend
+    mode http
+    balance leastconn
+    # برای vmselect بهتر است از یک کوئری ساده به جای /health استفاده شود
+    option httpchk GET /health
+    http-check expect status 200
+    server vmselect1 192.168.101.111:8481 check
+    server vmselect2 192.168.101.112:8481 check
+    server vmselect3 192.168.101.113:8481 check
